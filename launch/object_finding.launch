@@ -1,0 +1,8 @@
+<launch>
+    <env name="ROSCONSOLE_CONFIG_FILE"
+         value="$(find object_finding)/config/roslog.conf"/>
+    <include file="$(find turtlebot3_navigation)/launch/turtlebot3_navigation.launch">
+        <arg name="map_file" value="$(find object_finding)/maps/train_env.yaml"/>
+    </include>
+    <node pkg="object_finding" name="object_finding" type="object_finding.py" output="screen"/>
+</launch>
