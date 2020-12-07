@@ -4,6 +4,7 @@ import itertools
 import math
 import sys
 import random
+import time
 
 import actionlib
 import cv_bridge
@@ -19,6 +20,7 @@ from sensor_msgs.msg import Image, LaserScan, CameraInfo, PointCloud2
 from object_finders import find_green_box
 from object_finder import ObjectFinder
 from std_msgs.msg import Header
+from std_srvs.srv import Empty
 from typing import Optional, List, Tuple, Callable
 
 
@@ -32,6 +34,10 @@ def get_header():
         stamp=rospy.Time.now(),
         frame_id='map'
     )
+
+
+def clamp(value, mag_max):
+    return max(min(value, mag_max), -mag_max)
 
 
 class ObjectFinding:
@@ -59,16 +65,23 @@ class ObjectFinding:
     scan_max = None  # type: Optional[float]
     target_scan_index = None  # type: Optional[int]
 
-    forward_vel = None  # type: Optional[float]
+    object_offset = None  # type: Optional[float]
+
+    lin_vel = None  # type: Optional[float]
+    ang_vel = None  # type: Optional[float]
+
+    stationary_ticks = 0
+
+    log_messages = []  # type: List[str]
 
     def __init__(self, object_finders, synchronize=True):
         """
-        @type object_finders: Callable[[ndarray], Tuple[int,int]]
+        @type object_finders: Tuple[Callable[[ndarray], Tuple[int,int]], str]
         @type synchronize: bool
         @author Callum
         """
         # Insert finder functions into containing classes
-        self.object_finders = list(map(lambda of: ObjectFinder(of),
+        self.object_finders = list(map(lambda of: ObjectFinder(*of),
                                        object_finders))
 
         self.bridge = cv_bridge.CvBridge()
@@ -101,20 +114,20 @@ class ObjectFinding:
         Blocks until rospy.Time.now() returns a valid value
         @author Callum
         """
-        print 'Synchronizing'
+        self.log('Synchronizing')
         while rospy.Time.now().to_sec() == 0:
             self.sleep()
-        print 'Synchronized'
+        self.log('Synchronized')
 
     def await_action_server(self):
         """
         Blocks until action action server is ready
         @author Callum
         """
-        print 'Awaiting action server'
+        self.log('Awaiting action server')
         while not self.action_client.wait_for_server():
             self.sleep()
-        print 'Action server ready'
+        self.log('Action server ready')
 
     def find_space(self, offset_tolerance=0.05, vel_p=0.4):
         """
@@ -125,14 +138,14 @@ class ObjectFinding:
         @type vel_p: float
         @author Callum
         """
-        print 'Finding space'
+        self.log('Finding space')
         offset = (self.scan_ranges[0] - self.scan_ranges[180]) / 2
         while not -offset_tolerance < offset < offset_tolerance:
             self.sleep()
             offset = (self.scan_ranges[0] - self.scan_ranges[180]) / 2
             self.send_velocity(linear=offset * vel_p)
 
-        print 'Found space'
+        self.log('Found space')
         self.stop(cancel=False)
 
     def sleep(self):
@@ -169,7 +182,7 @@ class ObjectFinding:
         @param cluster_pass_count: Amount of passes to make
         @type cluster_pass_count: int
         """
-        print 'Finding checkpoints'
+        self.log('Finding checkpoints')
         # Find viable grid cells for seeds
         _, walls = cv2.threshold(self.map.astype(np.uint8), 50, 1, cv2.THRESH_BINARY)
         # 1 if space, 0 if wall or unknown
@@ -348,7 +361,7 @@ class ObjectFinding:
         self.checkpoints = list(
             map(lambda pn: self.grid_to_world(pn[0][0] + room_x, pn[0][1] + room_y), maxima)
         )
-        print 'Found {} checkpoints'.format(len(self.checkpoints))
+        self.log('Found {} checkpoints'.format(len(self.checkpoints)))
 
     def room_to_grid(self, room_x, room_y):
         """
@@ -438,7 +451,7 @@ class ObjectFinding:
             self.initialpose_pub.publish(pose)
             self.rate_limiter.sleep()
 
-        print 'Set pose to {} after {} tries'.format(position, tries)
+        self.log('Set pose to {} after {} tries'.format(position, tries))
 
     def send_goal(self, position):
         """
@@ -452,7 +465,7 @@ class ObjectFinding:
                 pose=position.to_pose()
             )
         ))
-        print 'Sent goal: {}'.format(position)
+        self.log('Sent goal: {}'.format(position))
 
     def set_next_checkpoint(self):
         """
@@ -493,7 +506,7 @@ class ObjectFinding:
         self.next_checkpoint = candidate_checkpoints[
             int(np.argmin(map(lambda c: self.amcl_pos.distance_from(c), candidate_checkpoints)))
         ]
-        print "Chosen {}".format(self.next_checkpoint)
+        self.log("Chosen {}".format(self.next_checkpoint))
 
     def next_checkpoint_distance(self):
         """
@@ -527,35 +540,50 @@ class ObjectFinding:
             # Determine next checkpoint and set as target
             self.set_next_checkpoint()
             self.send_goal(self.next_checkpoint)
+            self.stationary_ticks = 0
 
+            panic = False
             found_object = False
             # Loop until contact with checkpoint
             while self.next_checkpoint_distance() > 0.3:
+                if -0.1 < self.lin_vel < 0.1 and -0.1 < self.ang_vel < 0.1:
+                    self.stationary_ticks += 1
+                    if self.stationary_ticks >= 40:
+                        panic = True
+                        self.log('Stopped for too long, resetting costmaps')
+                        # I dont know why this works but it does, sometimes the nav stack stops responding, looks as if
+                        # the costmaps are getting confused
+                        rospy.ServiceProxy('/move_base/clear_costmaps', Empty)()
+                        break
+
+
                 # Abort if blocked yet close to checkpoint
                 if self.next_checkpoint_distance() < 1 and self.scan_min() < 0.35:
                     break
 
-                for finder in self.object_finders:
-                    # Break if object already found
-                    if finder.object_pos is not None:
-                        continue
-                    # If object found
-                    if finder.find(self.camera_image):
-                        self.stop()
-                        # If approach successful
-                        if self.approach_object(finder):
-                            found_object = True
-                            break
-                # Break to find new checkpoint closer to current position
-                if found_object:
-                    break
+                # Look only if not swinging around
+                if self.ang_vel < 0.4:
+                    for finder in self.object_finders:
+                        # Break if object already found
+                        if finder.object_pos is not None:
+                            continue
+                        # If object found
+                        if finder.find(self.camera_image):
+                            self.stop()
+                            # If approach successful
+                            if self.approach_object(finder):
+                                found_object = True
+                                break
+                    # Break to find new checkpoint closer to current position
+                    if found_object:
+                        break
 
                 self.sleep()
             # Continue to find new checkpoint closer to current position
-            if found_object:
+            if found_object or panic:
                 continue
 
-            print 'Hit checkpoint ' + str(checkpoint_index)
+            self.log('Hit checkpoint ' + str(checkpoint_index))
             self.stop()
             # Mark checkpoint as visited
             self.unvisited.remove(self.next_checkpoint)
@@ -577,7 +605,7 @@ class ObjectFinding:
 
         return math.atan(center_projection[0] * math.tan(half_fov))
 
-    def approach_object(self, finder, forward_vel=0.3, ang_p=0.25):
+    def approach_object(self, finder, forward_vel=0.3, ang_p=0.25, max_ang_vel=0.2):
         """
         Stops, approaches object and marks it's position. Aborts if object leaves screen
         @type finder: ObjectFinder
@@ -589,6 +617,8 @@ class ObjectFinding:
         @rtype: bool
         @author: Callum
         """
+        if not finder.find(self.camera_image):
+            return False
         self.align_to_object(finder)
         self.stop()
         # While 1m away from forward obstacle
@@ -598,10 +628,12 @@ class ObjectFinding:
                 return False
             # Move forward and turn towards object
             angle_offset = self.angle_offset(finder.screen_pos)
+            self.object_offset = angle_offset
             self.target_scan_index = int((angle_offset / (math.pi * 2)) * 360)
-            self.send_velocity(linear=forward_vel, angular=-angle_offset * ang_p)
+            self.send_velocity(linear=forward_vel, angular=clamp(-angle_offset * ang_p, max_ang_vel))
             self.sleep()
         self.stop()
+        self.object_offset = None
         # Last chance abort
         if not finder.find(self.camera_image):
             return False
@@ -610,7 +642,7 @@ class ObjectFinding:
         object_range = self.get_range(offset)
         finder.object_pos = (self.amcl_pos.x + math.cos(self.amcl_pos.theta + offset) * object_range,
                              self.amcl_pos.y + math.sin(self.amcl_pos.theta + offset) * object_range)
-        print 'Object at {}'.format(finder.object_pos)
+        self.log('Found {} at {}'.format(finder.name, finder.object_pos))
         return True
 
     def get_range(self, angle):
@@ -638,9 +670,9 @@ class ObjectFinding:
             offset = self.angle_offset(finder.screen_pos)
             self.display()
             # Use proportional control to angle towards object
-            self.send_velocity(angular=max(min(-offset * ang_p, max_ang_vel), -max_ang_vel))
+            self.send_velocity(angular=clamp(-offset * ang_p, max_ang_vel))
             self.rate_limiter.sleep()
-        print 'Aligned to object'
+        self.log('Aligned to ' + finder.name)
 
     def stop(self, cancel=True):
         """
@@ -648,19 +680,26 @@ class ObjectFinding:
         @type cancel: bool
         @author Callum
         """
-        print 'Stopping'
+        self.log('Stopping')
         if cancel:
             self.action_client.cancel_all_goals()
 
         # Slow down
-        while self.forward_vel > 0.01:
-            self.cmd_vel_pub.publish(Twist(Vector3(max(self.forward_vel * 0.2, 0), 0, 0), Vector3(0, 0, 0)))
+        while self.lin_vel > 0.01:
+            self.cmd_vel_pub.publish(Twist(Vector3(max(self.lin_vel * 0.2, 0), 0, 0), Vector3(0, 0, 0)))
             self.sleep()
 
         # Stop and hold
         for _ in range(10):
             self.cmd_vel_pub.publish(Twist(Vector3(0, 0, 0), Vector3(0, 0, 0)))
             self.sleep()
+
+    def log(self, message):
+        """
+        @type message: str
+        """
+        self.log_messages.append(message)
+        print message
 
     def display(self):
         """
@@ -702,8 +741,9 @@ class ObjectFinding:
                 screen_x, screen_y = finder.screen_pos
                 cv2.circle(camera_output, (int(screen_x / 2), int(screen_y / 2)), 10, (255, 0, 0))
 
-        # Display current position on map
-        cv2.circle(room_image, to_room_image(self.amcl_pos), 10, (255, 0, 0), -1)
+        if self.amcl_pos is not None:
+            # Display current position on map
+            cv2.circle(room_image, to_room_image(self.amcl_pos), 10, (255, 0, 0), -1)
 
         # Display calculated checkpoints
         if self.checkpoints is not None:
@@ -735,21 +775,36 @@ class ObjectFinding:
                      'RECALLED',
                      'LOST']
 
-        # Status labels, tuple of label name, validator, value generator
+        def format_float(float):
+            return '{:.2f}'.format(float)
+
+        # Status labels, tuples of label name, validator, value generator
         status_labels = [
-            ('next checkpoint', self.next_checkpoint, lambda: self.next_checkpoint_distance()),
-            ('scan min', self.scan_ranges, lambda: self.scan_min()),
-            ('forward velocity', self.forward_vel, lambda: self.forward_vel),
-            ('goal status', True, lambda: ac_states[self.action_client.get_state()])
+            ('next checkpoint', self.next_checkpoint, lambda: format_float(self.next_checkpoint_distance())),
+            ('scan min', self.scan_ranges, lambda: format_float(self.scan_min())),
+            ('linear velocity', self.lin_vel, lambda: format_float(self.lin_vel)),
+            ('angular velocity', self.ang_vel, lambda: format_float(self.ang_vel)),
+            ('goal status', True, lambda: ac_states[self.action_client.get_state()]),
+            ('object offset', self.object_offset, lambda: format_float(self.object_offset)),
+            ('stationary ticks', True, lambda: self.stationary_ticks)
         ]
+
+        def draw_text(text, position, color=(255, 255, 255)):
+            """
+            Draws text on backplate
+            @type text: str
+            @type position: Tuple[int, int]
+            @type color: Tuple[int, int, int]
+            @author Callum
+            """
+            cv2.putText(out, text, position, cv2.FONT_HERSHEY_PLAIN, 1, color)
 
         # Calculates label values if validator is not None and draws on backplate
         for index in range(len(status_labels)):
             label = status_labels[index]
             if label[1] is not None:
-                cv2.putText(out, label[0] + ' = ' + str(label[2]()),
-                            (status_bar_height + 5, scaled_camera_height + 20 * (index + 1)), cv2.FONT_HERSHEY_PLAIN, 1,
-                            (255, 255, 255))
+                draw_text(label[0] + ' = ' + str(label[2]()),
+                          (status_bar_height + 5, scaled_camera_height + 20 * (index + 1)))
 
         scan_origin = (int(status_bar_height / 2), int(scaled_camera_height + (status_bar_height / 2)))
 
@@ -768,16 +823,26 @@ class ObjectFinding:
             range_y = int(scan_origin[1] - math.cos(scan_angle) * scan_length)
             cv2.line(out, scan_origin, (range_x, range_y), color)
 
-        # Draw all lines
-        for scan_index in range(360):
-            draw_scan(scan_index)
+        if self.scan_ranges is not None:
+            # Draw all lines
+            for scan_index in range(360):
+                draw_scan(scan_index)
 
-        # Draw cardinal lines in red
-        for scan_index in range(0, 360, 90):
-            draw_scan(scan_index, color=(0, 0, 255))
+            # Draw cardinal lines in red
+            for scan_index in range(0, 360, 90):
+                draw_scan(scan_index, color=(0, 0, 255))
 
-        if self.target_scan_index is not None:
-            draw_scan(self.target_scan_index, color=(255, 0, 0))
+            if self.target_scan_index is not None:
+                draw_scan(self.target_scan_index, color=(255, 0, 0))
+
+        # Draw log messages
+        log_message_width = 500
+        for message_index in range(15):
+            if message_index >= len(self.log_messages):
+                break
+            draw_text(self.log_messages[-message_index - 1], (
+                scaled_room_width + scaled_camera_width - log_message_width,
+                scaled_camera_height + status_bar_height - 5 - 20 * message_index))
 
         cv2.imshow('Display', out)
         cv2.waitKey(1)
@@ -841,12 +906,13 @@ class ObjectFinding:
         @type msg: Odometry
         @author Callum
         """
-        self.forward_vel = msg.twist.twist.linear.x
+        self.lin_vel = msg.twist.twist.linear.x
+        self.ang_vel = msg.twist.twist.angular.z
 
 
 if __name__ == '__main__':
     # rospy.ServiceProxy('gazebo/reset_simulation', Empty)()
-    object_finding = ObjectFinding([find_green_box])
+    object_finding = ObjectFinding([(find_green_box, 'Green box')])
     object_finding.set_initial_position(Position(-1.299982, 4.200055))
     object_finding.find_space()
     object_finding.search()
