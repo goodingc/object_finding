@@ -57,7 +57,7 @@ class ObjectFinding:
     image_width = None  # type: Optional[float]
 
     room = None  # type: Optional[ndarray]
-    room_image = None  # type: Optional[ndarray]
+    room_grid = None  # type: Optional[ndarray]
     room_x = None  # type: Optional[int]
     room_y = None  # type: Optional[int]
 
@@ -216,7 +216,7 @@ class ObjectFinding:
 
         # Hoist variables to class for use in display
         self.room = room
-        self.room_image = cv2.cvtColor(room * 255, cv2.COLOR_GRAY2RGB)
+        self.room_grid = cv2.cvtColor(room * 255, cv2.COLOR_GRAY2RGB)
         self.room_x = room_x
         self.room_y = room_y
 
@@ -548,7 +548,7 @@ class ObjectFinding:
             while self.next_checkpoint_distance() > 0.3:
                 if -0.1 < self.lin_vel < 0.1 and -0.1 < self.ang_vel < 0.1:
                     self.stationary_ticks += 1
-                    if self.stationary_ticks >= 40:
+                    if self.stationary_ticks >= 30:
                         panic = True
                         self.log('Stopped for too long, resetting costmaps')
                         # I dont know why this works but it does, sometimes the nav stack stops responding, looks as if
@@ -706,13 +706,13 @@ class ObjectFinding:
         Displays GUI
         @author Callum
         """
-        if self.camera_image is None or self.room_image is None:
+        if self.camera_image is None or self.room_grid is None:
             return
 
         # Calculate main panel sizes
         camera_height, camera_width = self.camera_image.shape[:2]
         scaled_camera_height, scaled_camera_width = camera_height / 2, camera_width / 2
-        room_height, room_width = self.room_image.shape[:2]
+        room_height, room_width = self.room_grid.shape[:2]
         room_scale = scaled_camera_height / float(room_height)
         scaled_room_width = int(room_width * room_scale)
 
@@ -726,10 +726,12 @@ class ObjectFinding:
             @author Callum
             """
             room_x, room_y = self.world_to_room(position)
-            return int(room_x * room_scale), int(room_y * room_scale)
+            return scaled_room_width - int(room_x * room_scale), int(room_y * room_scale)
 
-        room_image = cv2.resize(self.room_image, (scaled_room_width, scaled_camera_height),
-                                interpolation=cv2.INTER_NEAREST)
+        room_image = cv2.flip(
+            cv2.resize(self.room_grid, (scaled_room_width, scaled_camera_height), interpolation=cv2.INTER_NEAREST),
+            1
+        )
 
         # Display object coordinates on map if located, or screen coordinates if within view
         for finder in self.object_finders:
