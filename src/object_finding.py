@@ -63,9 +63,10 @@ class ObjectFinding:
 
     scan_ranges = None  # type: Optional[List[float]]
     scan_max = None  # type: Optional[float]
-    target_scan_index = None  # type: Optional[int]
 
     object_offset = None  # type: Optional[float]
+    object_scan_index = None  # type: Optional[int]
+    object_range = None  # type: Optional[float]
 
     lin_vel = None  # type: Optional[float]
     ang_vel = None  # type: Optional[float]
@@ -206,7 +207,7 @@ class ObjectFinding:
         room_height += room_frame * 2
 
         # Crop space image to preserve room area
-        room = space[room_y:room_y + room_height, room_x:room_x + room_height]
+        room = space[room_y:room_y + room_height, room_x:room_x + room_width]
 
         # Morphological opening of room image to remove disjoint islands of space
         # Helps avoid placing seed points outside of the main room area
@@ -290,6 +291,9 @@ class ObjectFinding:
                 look_x, look_y = offset[0] + int_x, offset[1] + int_y
                 # If point is within the room and is a wall
                 if 0 < look_x < room_width and 0 < look_y < room_height and room[look_y, look_x] != 1:
+                    # Shouldn't happen, but did once
+                    if distance == 0:
+                        continue
                     cluster_vector += offset / distance
                     wall_hits += 1
                 # When 5 wall cells have been hit, break
@@ -320,46 +324,38 @@ class ObjectFinding:
 
         point_neighbours = list(map(get_neighbours, points))
 
-        def local_maximum(pn):
+        def local_minimum(pn):
             """
             @param pn: Tuple of a point and count of it's neighbours
             @type pn: Tuple[ndarray, int]
-            @return: True if a point has no neighbouring points with a higher neighbour count, False otherwise
+            @return: True if a point has no neighbouring points with a lower neighbour count, False otherwise
             @rtype: bool
             """
             (point, neighbours) = pn
+            for other_point, other_neighbours in point_neighbours:
+                if offset_distance(other_point - point) is not None:
+                    if other_neighbours < neighbours:
+                        return False
+            return True
 
-            def more_than_local(other_pn):
-                """
-                @param other_pn: Tuple of a point and count of it's neighbours
-                @type other_pn: Tuple[ndarray, int]
-                @return: True if other_point has more neighbours than point and is a neighbour of point, False otherwise
-                """
-                (other_point, other_neighbours) = other_pn
-                if offset_distance(other_point - point) is None:
-                    return False
-                return other_neighbours < neighbours
-
-            return not any(map(more_than_local, point_neighbours))
-
-        maxima = list(filter(local_maximum, point_neighbours))
+        minima = list(filter(local_minimum, point_neighbours))
 
         # Remove points with equal neighbour count that are also neighbours
         point_indices_to_remove = []
-        for higher_index in range(len(maxima)):
-            higher, _ = maxima[higher_index]
+        for higher_index in range(len(minima)):
+            higher, _ = minima[higher_index]
             for lower_index in range(higher_index):
-                lower, _ = maxima[lower_index]
+                lower, _ = minima[lower_index]
                 if offset_distance(lower - higher):
                     point_indices_to_remove.append(higher_index)
                     break
 
         point_indices_to_remove.reverse()
         for point_index in point_indices_to_remove:
-            maxima.pop(point_index)
+            minima.pop(point_index)
 
         self.checkpoints = list(
-            map(lambda pn: self.grid_to_world(pn[0][0] + room_x, pn[0][1] + room_y), maxima)
+            map(lambda pn: self.grid_to_world(pn[0][0] + room_x, pn[0][1] + room_y), minima)
         )
         self.log('Found {} checkpoints'.format(len(self.checkpoints)))
 
@@ -548,7 +544,7 @@ class ObjectFinding:
             while self.next_checkpoint_distance() > 0.3:
                 if -0.1 < self.lin_vel < 0.1 and -0.1 < self.ang_vel < 0.1:
                     self.stationary_ticks += 1
-                    if self.stationary_ticks >= 30:
+                    if self.stationary_ticks >= 15:
                         panic = True
                         self.log('Stopped for too long, resetting costmaps')
                         # I dont know why this works but it does, sometimes the nav stack stops responding, looks as if
@@ -568,7 +564,7 @@ class ObjectFinding:
                         if finder.object_pos is not None:
                             continue
                         # If object found
-                        if finder.find(self.camera_image):
+                        if self.find_object(finder):
                             self.stop()
                             # If approach successful
                             if self.approach_object(finder):
@@ -613,47 +609,46 @@ class ObjectFinding:
         @type forward_vel: float
         @param ang_p: P value of proportional control of angular velocity
         @type ang_p: float
+        @type max_ang_vel: float
         @return: True if successful, False if aborted
         @rtype: bool
         @author: Callum
         """
-        if not finder.find(self.camera_image):
+        if not self.align_to_object(finder):
             return False
-        self.align_to_object(finder)
         self.stop()
         # While 1m away from forward obstacle
         while self.scan_ranges[0] > 1:
             # Abort if object is lost
-            if not finder.find(self.camera_image):
+            if not self.find_object(finder):
                 return False
             # Move forward and turn towards object
-            angle_offset = self.angle_offset(finder.screen_pos)
-            self.object_offset = angle_offset
-            self.target_scan_index = int((angle_offset / (math.pi * 2)) * 360)
-            self.send_velocity(linear=forward_vel, angular=clamp(-angle_offset * ang_p, max_ang_vel))
+            self.send_velocity(linear=forward_vel, angular=clamp(-self.object_offset * ang_p, max_ang_vel))
             self.sleep()
         self.stop()
-        self.object_offset = None
         # Last chance abort
-        if not finder.find(self.camera_image):
+        if not self.find_object(finder):
             return False
         # Calculate approximate coordinates of target object
-        offset = self.angle_offset(finder.screen_pos)
-        object_range = self.get_range(offset)
-        finder.object_pos = (self.amcl_pos.x + math.cos(self.amcl_pos.theta + offset) * object_range,
-                             self.amcl_pos.y + math.sin(self.amcl_pos.theta + offset) * object_range)
+        finder.object_pos = (self.amcl_pos.x + math.cos(self.amcl_pos.theta + self.object_offset) * self.object_range,
+                             self.amcl_pos.y + math.sin(self.amcl_pos.theta + self.object_offset) * self.object_range)
         self.log('Found {} at {}'.format(finder.name, finder.object_pos))
+        self.object_scan_index = None
+        self.object_offset = None
+        self.object_range = None
         return True
 
-    def get_range(self, angle):
-        """
-        @author: Callum
-        """
-        return self.scan_ranges[int((angle / (math.pi * 2)) * 360)]
+    def find_object(self, finder):
+        if not finder.find(self.camera_image):
+            return False
+        self.object_offset = self.angle_offset(finder.screen_pos)
+        self.object_scan_index = -int((self.object_offset / (math.pi * 2)) * 360)
+        self.object_range = self.scan_ranges[self.object_scan_index]
+        return True
 
-    def align_to_object(self, finder, max_ang_vel=0.2, ang_p=0.5, ang_threshold=0.05):
+    def align_to_object(self, finder, max_ang_vel=0.2, ang_p=0.6, ang_threshold=0.05):
         """
-        Aligns the robot to the given object
+        Aligns the robot to the given object, aborts if necessary
         @type finder: ObjectFinder
         @param max_ang_vel: Angular velocity cap to avoid overshooting
         @type max_ang_vel: float
@@ -661,23 +656,29 @@ class ObjectFinding:
         @type ang_p: float
         @param ang_threshold: Dead zone width for alignment, in rads
         @type ang_threshold: float
+        @return: True if aligned, False if lost object
+        @rtype: bool
         @author: Callum
         """
-        offset = self.angle_offset(finder.screen_pos)
+        if not self.find_object(finder):
+            return False
         # While unaligned
-        while not -ang_threshold < offset < ang_threshold:
-            finder.find(self.camera_image)
-            offset = self.angle_offset(finder.screen_pos)
+        while not -ang_threshold < self.object_offset < ang_threshold:
+            if not self.find_object(finder):
+                return False
             self.display()
             # Use proportional control to angle towards object
-            self.send_velocity(angular=clamp(-offset * ang_p, max_ang_vel))
+            self.send_velocity(angular=clamp(-self.object_offset * ang_p, max_ang_vel))
             self.rate_limiter.sleep()
         self.log('Aligned to ' + finder.name)
+        return True
 
-    def stop(self, cancel=True):
+    def stop(self, cancel=True, stop_p=0.5):
         """
         Stops the robot and optionally cancels action server goals
         @type cancel: bool
+        @param stop_p: P value for speed controller
+        @type stop_p: float
         @author Callum
         """
         self.log('Stopping')
@@ -685,13 +686,13 @@ class ObjectFinding:
             self.action_client.cancel_all_goals()
 
         # Slow down
-        while self.lin_vel > 0.01:
-            self.cmd_vel_pub.publish(Twist(Vector3(max(self.lin_vel * 0.2, 0), 0, 0), Vector3(0, 0, 0)))
+        while not -0.01 < self.lin_vel < 0.01:
+            self.send_velocity(linear=self.lin_vel * stop_p)
             self.sleep()
 
         # Stop and hold
         for _ in range(10):
-            self.cmd_vel_pub.publish(Twist(Vector3(0, 0, 0), Vector3(0, 0, 0)))
+            self.send_velocity()
             self.sleep()
 
     def log(self, message):
@@ -788,6 +789,7 @@ class ObjectFinding:
             ('angular velocity', self.ang_vel, lambda: format_float(self.ang_vel)),
             ('goal status', True, lambda: ac_states[self.action_client.get_state()]),
             ('object offset', self.object_offset, lambda: format_float(self.object_offset)),
+            ('object range', self.object_range, lambda: format_float(self.object_range)),
             ('stationary ticks', True, lambda: self.stationary_ticks)
         ]
 
@@ -834,8 +836,8 @@ class ObjectFinding:
             for scan_index in range(0, 360, 90):
                 draw_scan(scan_index, color=(0, 0, 255))
 
-            if self.target_scan_index is not None:
-                draw_scan(self.target_scan_index, color=(255, 0, 0))
+            if self.object_scan_index is not None:
+                draw_scan(self.object_scan_index, color=(255, 0, 0))
 
         # Draw log messages
         log_message_width = 500
