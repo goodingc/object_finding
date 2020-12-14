@@ -17,7 +17,7 @@ from nav_msgs.msg import OccupancyGrid, Odometry
 from numpy import ndarray
 from position import Position
 from sensor_msgs.msg import Image, LaserScan, CameraInfo, PointCloud2
-from object_finders import find_green_box
+from object_finders import find_green_box, find_fire_hydrant, find_mail_box
 from object_finder import ObjectFinder
 from std_msgs.msg import Header
 from std_srvs.srv import Empty
@@ -916,8 +916,9 @@ class ObjectFinding:
 
 if __name__ == '__main__':
     # rospy.ServiceProxy('gazebo/reset_simulation', Empty)()
-    object_finding = ObjectFinding([(find_green_box, 'Green box')])
+    object_finding = ObjectFinding([(find_green_box, 'Green box'),(find_fire_hydrant,'Fire Hydrant'),(find_mail_box,'Mailbox')])
     object_finding.set_initial_position(Position(-1.299982, 4.200055))
     object_finding.find_space()
     object_finding.search()
     rospy.spin()
+
