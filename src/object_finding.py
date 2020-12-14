@@ -552,7 +552,6 @@ class ObjectFinding:
                         rospy.ServiceProxy('/move_base/clear_costmaps', Empty)()
                         break
 
-
                 # Abort if blocked yet close to checkpoint
                 if self.next_checkpoint_distance() < 1 and self.scan_min() < 0.35:
                     break
@@ -916,9 +915,9 @@ class ObjectFinding:
 
 if __name__ == '__main__':
     # rospy.ServiceProxy('gazebo/reset_simulation', Empty)()
-    object_finding = ObjectFinding([(find_green_box, 'Green box'),(find_fire_hydrant,'Fire Hydrant'),(find_mail_box,'Mailbox')])
+    object_finding = ObjectFinding(
+        [(find_green_box, 'Green box'), (find_fire_hydrant, 'Fire Hydrant'), (find_mail_box, 'Mailbox')])
     object_finding.set_initial_position(Position(-1.299982, 4.200055))
     object_finding.find_space()
     object_finding.search()
     rospy.spin()
-
