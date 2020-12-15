@@ -12,7 +12,12 @@ class ObjectFinder:
         """
         self.finder = finder
         self.name = name
+        self.failed_attempts = 0
+        self.found = False
 
     def find(self, camera_image):
         self.screen_pos = self.finder(camera_image)
-        return self.screen_pos is not None
+        if self.screen_pos is not None:
+            self.screen_pos = int(self.screen_pos[0]), int(self.screen_pos[1])
+            return True
+        return False
