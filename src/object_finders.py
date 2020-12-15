@@ -41,7 +41,7 @@ def find_fire_hydrant(image):
     # And to remove erroneous responses 
     kernel = np.ones((3,3),np.uint8)    
     mask = cv2.dilate(mask,kernel,iterations = 1)
-    mask = cv2.erode(mask,kernel,iterations = 3
+    mask = cv2.erode(mask,kernel,iterations = 3)
     mask = cv2.dilate(mask,kernel,iterations = 1)
     
     _, contours, _ = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)  # Extract contours (edges) from binary mask
@@ -80,7 +80,7 @@ def find_mail_box(image):
 
     _, contours, _ = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)  # Extract contours (edges) from binary mask
 
-    if len(contours) == 0:  # Exit if no contours (edges) found in binary image
+    if len(contours) == 0:  # Exit if no contours (edges) found in biAdnary image
         return
 
     largest_contour = contours[np.argmax(map(cv2.contourArea, contours))]
@@ -95,3 +95,19 @@ def find_mail_box(image):
 
     return [X_Pos, Y_Pos]
 
+def find_number_5(image):
+    """
+        @author Mohamed
+        @param image: Colour image from camera
+        @return: The screen-space coordinates of the number 5 box
+    """
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(hsv, np.array([0, 0, 0], dtype='uint8'),np.array([0, 0, 0], dtype='uint8'))
+    _, contours, _ = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_NONE)
+    if len(contours) is 0:
+        return
+    largest_contour = contours[np.argmax(map(cv2.contourArea, contours))]
+    if cv2.contourArea(largest_contour) < 10:
+        return
+    moments = cv2.moments(largest_contour)
+    return moments["m10"] / moments["m00"], moments["m01"] / moments["m00"]
