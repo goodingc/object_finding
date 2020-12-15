@@ -18,7 +18,7 @@ from numpy import ndarray
 from position import Position
 from sensor_msgs.msg import Image, LaserScan, CameraInfo, PointCloud2
 import sensor_msgs.point_cloud2 as pc2
-from object_finders import find_green_box, find_fire_hydrant, find_mail_box
+from object_finders import find_green_box, find_fire_hydrant, find_mail_box, find_number_5
 from object_finder import ObjectFinder
 from std_msgs.msg import Header
 from std_srvs.srv import Empty
@@ -592,19 +592,20 @@ class ObjectFinding:
                             continue
                         # If object found
                         if self.find_object(finder):
-                            self.stop()
-                            # If approach successful
-                            if self.approach_object(finder):
-                                found_object = True
-                                self.objects_found += 1
-                            else:
-                                panic = True
-                                finder.failed_attempts += 1
-                                self.stop()
-                                if finder.failed_attempts >= 5:
-                                    self.log('Too many failed attempts, using best guess')
-                                    self.declare_found(finder)
-                            break
+                            pass
+                            # self.stop()
+                            # # If approach successful
+                            # if self.approach_object(finder):
+                            #     found_object = True
+                            #     self.objects_found += 1
+                            # else:
+                            #     panic = True
+                            #     finder.failed_attempts += 1
+                            #     self.stop()
+                            #     if finder.failed_attempts >= 5:
+                            #         self.log('Too many failed attempts, using best guess')
+                            #         self.declare_found(finder)
+                            # break
 
                     # Break to find new checkpoint closer to current position
                     if found_object:
@@ -1026,7 +1027,7 @@ class ObjectFinding:
 if __name__ == '__main__':
     # rospy.ServiceProxy('gazebo/reset_simulation', Empty)()
     object_finding = ObjectFinding(
-        [(find_green_box, 'Green box'), (find_fire_hydrant, 'Fire Hydrant'), (find_mail_box, 'Mailbox')])
+        [(find_green_box, 'Green box'), (find_fire_hydrant, 'Fire Hydrant'), (find_mail_box, 'Mailbox'), (find_number_5, 'Number 5')])
     object_finding.set_initial_position(Position(-1.299982, 4.200055))
     object_finding.find_space()
     object_finding.search()

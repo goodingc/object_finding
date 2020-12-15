@@ -106,3 +106,16 @@ def find_mail_box(image):
     Y_Pos = moments["m01"] / moments["m00"]  # Calculate Y position of centroid from moments
 
     return [X_Pos, Y_Pos]
+
+
+def find_number_5(image):
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    ret, thresh = cv2.threshold(gray, 1, 255, cv2.THRESH_BINARY)
+    _, contours, _ = cv2.findContours(thresh, cv2.RETR_TREE, cv2.CHAIN_APPROX_NONE)
+    if len(contours) is 0:
+        return
+    largest_contour = contours[np.argmax(map(cv2.contourArea, contours))]
+    if cv2.contourArea(largest_contour) < 10:
+        return
+    moments = cv2.moments(largest_contour)
+    return moments["m10"] / moments["m00"], moments["m01"] / moments["m00"]
