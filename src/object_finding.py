@@ -17,6 +17,7 @@ from nav_msgs.msg import OccupancyGrid, Odometry
 from numpy import ndarray
 from position import Position
 from sensor_msgs.msg import Image, LaserScan, CameraInfo, PointCloud2
+import sensor_msgs.point_cloud2 as pc2
 from object_finders import find_green_box, find_fire_hydrant, find_mail_box
 from object_finder import ObjectFinder
 from std_msgs.msg import Header
@@ -36,6 +37,18 @@ def get_header():
     )
 
 
+ac_states = ['PENDING',
+             'ACTIVE',
+             'PREEMPTED',
+             'SUCCEEDED',
+             'ABORTED',
+             'REJECTED',
+             'PREEMPTING',
+             'RECALLING',
+             'RECALLED',
+             'LOST']
+
+
 def clamp(value, mag_max):
     return max(min(value, mag_max), -mag_max)
 
@@ -50,8 +63,10 @@ class ObjectFinding:
     checkpoints = None  # type: Optional[List[Position]]
     unvisited = None  # type: Optional[List[Position]]
     next_checkpoint = None  # type: Optional[Position]
+    last_checkpoint_time = None  # type: Optional[float]
 
-    camera_image = None  # type: Optional[ndarray]
+    rgb_camera_image = None  # type: Optional[ndarray]
+    depth_camera_image = None  # type: Optional[ndarray]
 
     camera_matrix = None  # type: Optional[ndarray]
     image_width = None  # type: Optional[float]
@@ -66,7 +81,8 @@ class ObjectFinding:
 
     object_offset = None  # type: Optional[float]
     object_scan_index = None  # type: Optional[int]
-    object_range = None  # type: Optional[float]
+    object_scan_range = None  # type: Optional[float]
+    object_depth_range = None  # type: Optional[float]
 
     lin_vel = None  # type: Optional[float]
     ang_vel = None  # type: Optional[float]
@@ -85,6 +101,8 @@ class ObjectFinding:
         self.object_finders = list(map(lambda of: ObjectFinder(*of),
                                        object_finders))
 
+        self.objects_found = 0
+
         self.bridge = cv_bridge.CvBridge()
         rospy.init_node('object_finding')
         self.rate_limiter = rospy.Rate(10)
@@ -92,7 +110,8 @@ class ObjectFinding:
         rospy.Subscriber('camera/rgb/camera_info', CameraInfo, self.handle_camera_info)
         rospy.Subscriber('amcl_pose', PoseWithCovarianceStamped, self.handle_amcl_pose)
         rospy.Subscriber('map', OccupancyGrid, self.handle_map)
-        rospy.Subscriber('camera/rgb/image_raw', Image, self.handle_image)
+        rospy.Subscriber('camera/rgb/image_raw', Image, self.handle_rgb_image)
+        rospy.Subscriber('camera/depth/image_raw', Image, self.handle_depth_image)
         rospy.Subscriber('scan', LaserScan, self.handle_scan)
         rospy.Subscriber('odom', Odometry, self.handle_odom)
 
@@ -518,6 +537,9 @@ class ObjectFinding:
         """
         return min(self.scan_ranges)
 
+    def elapsed_checkpoint_time(self):
+        return time.time() - self.last_checkpoint_time
+
     def search(self):
         """
         Moves around room hitting precalculated checkpoints, interrupted when an object is visible
@@ -532,16 +554,22 @@ class ObjectFinding:
         checkpoint_index = 1
 
         # While there are unvisited checkpoints
-        while len(self.unvisited) > 0:
+        while len(self.unvisited) > 0 and self.objects_found < len(self.object_finders):
             # Determine next checkpoint and set as target
             self.set_next_checkpoint()
             self.send_goal(self.next_checkpoint)
             self.stationary_ticks = 0
+            self.last_checkpoint_time = time.time()
 
             panic = False
             found_object = False
             # Loop until contact with checkpoint
             while self.next_checkpoint_distance() > 0.3:
+                if self.elapsed_checkpoint_time() > 120:
+                    self.log('Took too long to get to checkpoint, aborting')
+                    panic = True
+                    break
+
                 if -0.1 < self.lin_vel < 0.1 and -0.1 < self.ang_vel < 0.1:
                     self.stationary_ticks += 1
                     if self.stationary_ticks >= 15:
@@ -553,14 +581,14 @@ class ObjectFinding:
                         break
 
                 # Abort if blocked yet close to checkpoint
-                if self.next_checkpoint_distance() < 1 and self.scan_min() < 0.35:
+                if self.next_checkpoint_distance() < 1 and self.danger_close():
                     break
 
-                # Look only if not swinging around
-                if self.ang_vel < 0.4:
+                # Look only if not swinging around and in free space
+                if self.ang_vel < 0.4 and not self.danger_close():
                     for finder in self.object_finders:
                         # Break if object already found
-                        if finder.object_pos is not None:
+                        if finder.found:
                             continue
                         # If object found
                         if self.find_object(finder):
@@ -568,7 +596,16 @@ class ObjectFinding:
                             # If approach successful
                             if self.approach_object(finder):
                                 found_object = True
-                                break
+                                self.objects_found += 1
+                            else:
+                                panic = True
+                                finder.failed_attempts += 1
+                                self.stop()
+                                if finder.failed_attempts >= 5:
+                                    self.log('Too many failed attempts, using best guess')
+                                    self.declare_found(finder)
+                            break
+
                     # Break to find new checkpoint closer to current position
                     if found_object:
                         break
@@ -583,6 +620,10 @@ class ObjectFinding:
             # Mark checkpoint as visited
             self.unvisited.remove(self.next_checkpoint)
             checkpoint_index += 1
+
+    def danger_close(self):
+        # return min(self.scan_ranges[:45] + self.scan_ranges[-45:]) < 0.35
+        return self.scan_min() < 0.35
 
     def angle_offset(self, screen_pos):
         """
@@ -617,9 +658,9 @@ class ObjectFinding:
             return False
         self.stop()
         # While 1m away from forward obstacle
-        while self.scan_ranges[0] > 1:
-            # Abort if object is lost
-            if not self.find_object(finder):
+        while self.object_depth_range > 1:
+            # Abort if object if lost
+            if not self.find_object(finder) or self.danger_close():
                 return False
             # Move forward and turn towards object
             self.send_velocity(linear=forward_vel, angular=clamp(-self.object_offset * ang_p, max_ang_vel))
@@ -628,22 +669,50 @@ class ObjectFinding:
         # Last chance abort
         if not self.find_object(finder):
             return False
+        self.display()
         # Calculate approximate coordinates of target object
-        finder.object_pos = (self.amcl_pos.x + math.cos(self.amcl_pos.theta + self.object_offset) * self.object_range,
-                             self.amcl_pos.y + math.sin(self.amcl_pos.theta + self.object_offset) * self.object_range)
-        self.log('Found {} at {}'.format(finder.name, finder.object_pos))
-        self.object_scan_index = None
-        self.object_offset = None
-        self.object_range = None
+        object_range = self.object_scan_range
+        if math.isinf(object_range):
+            object_range = self.object_depth_range
+            if math.isinf(object_range):
+                return False
+
+        self.declare_found(finder)
         return True
 
+    def declare_found(self, finder):
+        finder.found = True
+        self.log('Found {} at {}'.format(finder.name, finder.object_pos))
+        self.reset_object_data()
+
     def find_object(self, finder):
-        if not finder.find(self.camera_image):
+        if not finder.find(self.rgb_camera_image):
+            self.reset_object_data()
             return False
         self.object_offset = self.angle_offset(finder.screen_pos)
         self.object_scan_index = -int((self.object_offset / (math.pi * 2)) * 360)
-        self.object_range = self.scan_ranges[self.object_scan_index]
+        self.object_scan_range = self.scan_ranges[self.object_scan_index]
+        self.object_depth_range = self.depth_camera_image[finder.screen_pos[1], finder.screen_pos[0]]
+        if math.isnan(self.object_depth_range):
+            self.object_depth_range = np.inf
+
+        object_range = self.object_depth_range
+        if math.isinf(object_range):
+            object_range = self.object_depth_range
+            if math.isinf(object_range):
+                return False
+
+        finder.object_pos = (
+            self.amcl_pos.x + math.cos(self.amcl_pos.theta - self.object_offset) * object_range,
+            self.amcl_pos.y + math.sin(self.amcl_pos.theta - self.object_offset) * object_range
+        )
         return True
+
+    def reset_object_data(self):
+        self.object_offset = None
+        self.object_scan_index = None
+        self.object_scan_range = None
+        self.object_depth_range = None
 
     def align_to_object(self, finder, max_ang_vel=0.2, ang_p=0.6, ang_threshold=0.05):
         """
@@ -706,17 +775,17 @@ class ObjectFinding:
         Displays GUI
         @author Callum
         """
-        if self.camera_image is None or self.room_grid is None:
+        if self.rgb_camera_image is None or self.room_grid is None:
             return
 
         # Calculate main panel sizes
-        camera_height, camera_width = self.camera_image.shape[:2]
-        scaled_camera_height, scaled_camera_width = camera_height / 2, camera_width / 2
+        rgb_image_height, rgb_image_width = self.rgb_camera_image.shape[:2]
+        scaled_rgb_image_height, scaled_rgb_image_width = rgb_image_height / 2, rgb_image_width / 2
         room_height, room_width = self.room_grid.shape[:2]
-        room_scale = scaled_camera_height / float(room_height)
+        room_scale = scaled_rgb_image_height / float(room_height)
         scaled_room_width = int(room_width * room_scale)
 
-        camera_output = cv2.resize(self.camera_image, (scaled_camera_width, scaled_camera_height))
+        rgb_camera_output = cv2.resize(self.rgb_camera_image, (scaled_rgb_image_width, scaled_rgb_image_height))
 
         def to_room_image(position):
             """
@@ -729,7 +798,7 @@ class ObjectFinding:
             return scaled_room_width - int(room_x * room_scale), int(room_y * room_scale)
 
         room_image = cv2.flip(
-            cv2.resize(self.room_grid, (scaled_room_width, scaled_camera_height), interpolation=cv2.INTER_NEAREST),
+            cv2.resize(self.room_grid, (scaled_room_width, scaled_rgb_image_height), interpolation=cv2.INTER_NEAREST),
             1
         )
 
@@ -738,10 +807,9 @@ class ObjectFinding:
             if finder.object_pos is not None:
                 cv2.circle(room_image, to_room_image(Position(finder.object_pos[0], finder.object_pos[1])), 10,
                            (255, 255, 0), -1)
-                continue
-            if finder.screen_pos is not None:
+            if finder.screen_pos is not None and not finder.found:
                 screen_x, screen_y = finder.screen_pos
-                cv2.circle(camera_output, (int(screen_x / 2), int(screen_y / 2)), 10, (255, 0, 0))
+                cv2.circle(rgb_camera_output, (int(screen_x / 2), int(screen_y / 2)), 10, (255, 0, 0))
 
         if self.amcl_pos is not None:
             # Display current position on map
@@ -759,23 +827,51 @@ class ObjectFinding:
             cv2.circle(room_image, to_room_image(self.next_checkpoint), 10, (0, 255, 255), -1)
 
         status_bar_height = 300
+        log_message_width = 500
 
         # Compose room and camera images on background plate
-        out = np.zeros((scaled_camera_height + status_bar_height, scaled_camera_width + scaled_room_width, 3)).astype(
-            np.uint8)
-        out[:scaled_camera_height, :scaled_room_width] = room_image
-        out[:scaled_camera_height, scaled_room_width:] = camera_output
+        out = np.zeros(
+            (
+                scaled_rgb_image_height + status_bar_height,
+                scaled_rgb_image_width + scaled_room_width + log_message_width,
+                3
+            )
+        ).astype(np.uint8)
+        out[:scaled_rgb_image_height, :scaled_room_width] = room_image
+        out[:scaled_rgb_image_height, scaled_room_width:-log_message_width] = rgb_camera_output
 
-        ac_states = ['PENDING',
-                     'ACTIVE',
-                     'PREEMPTED',
-                     'SUCCEEDED',
-                     'ABORTED',
-                     'REJECTED',
-                     'PREEMPTING',
-                     'RECALLING',
-                     'RECALLED',
-                     'LOST']
+        scaled_depth_image_width = 0
+
+        if self.depth_camera_image is not None:
+            depth_image_height, depth_image_width = self.depth_camera_image.shape[:2]
+            depth_image_scale = status_bar_height / float(depth_image_height)
+            scaled_depth_image_width = int(depth_image_width * depth_image_scale)
+            scaled_depth_image_height = int(depth_image_height * depth_image_scale)
+
+            depth_camera_output = cv2.cvtColor(
+                (
+                        (cv2.resize(
+                            self.depth_camera_image,
+                            (scaled_depth_image_width, scaled_depth_image_height)
+                        ) / 5.) * 255
+                ).astype(np.uint8),
+                cv2.COLOR_GRAY2RGB
+            )
+
+            for finder in self.object_finders:
+                if finder.screen_pos is not None and not finder.found:
+                    screen_x, screen_y = finder.screen_pos
+                    cv2.circle(
+                        depth_camera_output,
+                        (int(screen_x * depth_image_scale), int(screen_y * depth_image_scale)),
+                        10,
+                        (255, 0, 0)
+                    )
+
+            out[
+            scaled_rgb_image_height:,
+            status_bar_height:status_bar_height + scaled_depth_image_width
+            ] = depth_camera_output
 
         def format_float(float):
             return '{:.2f}'.format(float)
@@ -783,13 +879,17 @@ class ObjectFinding:
         # Status labels, tuples of label name, validator, value generator
         status_labels = [
             ('next checkpoint', self.next_checkpoint, lambda: format_float(self.next_checkpoint_distance())),
+            ('checkpoint time', self.last_checkpoint_time, lambda: format_float(self.elapsed_checkpoint_time())),
             ('scan min', self.scan_ranges, lambda: format_float(self.scan_min())),
+            ('danger close', self.scan_ranges, lambda: 'YES' if self.danger_close() else 'NO'),
             ('linear velocity', self.lin_vel, lambda: format_float(self.lin_vel)),
             ('angular velocity', self.ang_vel, lambda: format_float(self.ang_vel)),
             ('goal status', True, lambda: ac_states[self.action_client.get_state()]),
             ('object offset', self.object_offset, lambda: format_float(self.object_offset)),
-            ('object range', self.object_range, lambda: format_float(self.object_range)),
-            ('stationary ticks', True, lambda: self.stationary_ticks)
+            ('object scan range', self.object_scan_range, lambda: format_float(self.object_scan_range)),
+            ('object depth range', self.object_depth_range, lambda: format_float(self.object_depth_range)),
+            ('stationary ticks', True, lambda: self.stationary_ticks),
+            ('objects found', True, lambda: self.objects_found)
         ]
 
         def draw_text(text, position, color=(255, 255, 255)):
@@ -807,9 +907,11 @@ class ObjectFinding:
             label = status_labels[index]
             if label[1] is not None:
                 draw_text(label[0] + ' = ' + str(label[2]()),
-                          (status_bar_height + 5, scaled_camera_height + 20 * (index + 1)))
+                          (
+                              status_bar_height + scaled_depth_image_width + 5,
+                              scaled_rgb_image_height + 20 * (index + 1)))
 
-        scan_origin = (int(status_bar_height / 2), int(scaled_camera_height + (status_bar_height / 2)))
+        scan_origin = (int(status_bar_height / 2), int(scaled_rgb_image_height + (status_bar_height / 2)))
 
         def draw_scan(scan_index, color=(255, 255, 255)):
             """
@@ -839,13 +941,12 @@ class ObjectFinding:
                 draw_scan(self.object_scan_index, color=(255, 0, 0))
 
         # Draw log messages
-        log_message_width = 500
-        for message_index in range(15):
+        for message_index in range(40):
             if message_index >= len(self.log_messages):
                 break
             draw_text(self.log_messages[-message_index - 1], (
-                scaled_room_width + scaled_camera_width - log_message_width,
-                scaled_camera_height + status_bar_height - 5 - 20 * message_index))
+                scaled_room_width + scaled_rgb_image_width + 5,
+                scaled_rgb_image_height + status_bar_height - 5 - 20 * message_index))
 
         cv2.imshow('Display', out)
         cv2.waitKey(1)
@@ -874,13 +975,13 @@ class ObjectFinding:
             self.map_origin = (msg.info.origin.position.x, msg.info.origin.position.y)
             self.find_checkpoints()
 
-    def handle_image(self, msg):
+    def handle_rgb_image(self, msg):
         """
         Sets camera image with bgr8 encoding
         @type msg: Image
         @author Callum
         """
-        self.camera_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+        self.rgb_camera_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
 
     def handle_scan(self, msg):
         """
@@ -889,9 +990,12 @@ class ObjectFinding:
         @author Callum
         """
         self.scan_ranges = list(
-            map(lambda scan_range: -1 if scan_range < msg.range_min else float(
-                'inf') if scan_range > msg.range_max else scan_range,
-                msg.ranges))
+            map(
+                lambda
+                    scan_range: -1 if scan_range < msg.range_min else np.inf if scan_range > msg.range_max else scan_range,
+                msg.ranges
+            )
+        )
         self.scan_max = msg.range_max
 
     def handle_camera_info(self, msg):
@@ -911,6 +1015,12 @@ class ObjectFinding:
         """
         self.lin_vel = msg.twist.twist.linear.x
         self.ang_vel = msg.twist.twist.angular.z
+
+    def handle_depth_image(self, msg):
+        """
+        @type msg: Image
+        """
+        self.depth_camera_image = self.bridge.imgmsg_to_cv2(msg)
 
 
 if __name__ == '__main__':
