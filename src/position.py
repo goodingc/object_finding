@@ -41,6 +41,18 @@ class Position:
             ),
         )
 
+    @staticmethod
+    def from_pose(pose):
+        """
+        @type pose: Pose
+        @rtype: Position
+        @author: Callum
+        """
+        (_, _, theta) = tf.transformations.euler_from_quaternion(
+            [pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w])
+        return Position(pose.position.x, pose.position.y, theta)
+
+
     def distance_from(self, other):
         """
         @type other: Position

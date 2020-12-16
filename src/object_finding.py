@@ -85,6 +85,7 @@ def format_bool(bool):
 
 
 class ObjectFinding:
+    pos = None  # type: Optional[Position]
     amcl_pos = None  # type: Optional[Position]
 
     map = None  # type: Optional[ndarray]
@@ -133,7 +134,7 @@ class ObjectFinding:
 
         self.bridge = cv_bridge.CvBridge()
         rospy.init_node('object_finding')
-        self.rate_limiter = rospy.Rate(10)
+        self.rate_limiter = rospy.Rate(30)
 
         rospy.Subscriber('camera/rgb/camera_info', CameraInfo, self.handle_camera_info)
         rospy.Subscriber('amcl_pose', PoseWithCovarianceStamped, self.handle_amcl_pose)
@@ -156,6 +157,9 @@ class ObjectFinding:
         if synchronize:
             self.synchronize()
             self.await_action_server()
+
+        self.set_initial_position()
+        self.find_space()
 
     def synchronize(self):
         """
@@ -466,17 +470,18 @@ class ObjectFinding:
         """
         return self.grid_to_world(*self.room_to_grid(room_x, room_y))
 
-    def set_initial_position(self, position):
+    def set_initial_position(self):
         """
         Provides initial pose guess and waits until it is corroborated
-        @type position: Position
         @author Callum
         """
         self.log('Setting pose')
+        while self.pos is None:
+            self.sleep()
         pose = PoseWithCovarianceStamped(
             header=get_header(),
             pose=PoseWithCovariance(
-                pose=position.to_pose(),
+                pose=self.pos.to_pose(),
                 covariance=[0.25, 0.0, 0.0, 0.0, 0.0, 0.0,
                             0.0, 0.25, 0.0, 0.0, 0.0, 0.0,
                             0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
@@ -487,12 +492,12 @@ class ObjectFinding:
         )
         tries = 0
         # Wait until self.amcl_pos == position
-        while self.amcl_pos is None or self.amcl_pos.distance_from(position) > 0.5:
+        while self.amcl_pos is None or self.amcl_pos.distance_from(self.pos) > 0.5:
             tries += 1
             self.initialpose_pub.publish(pose)
             self.rate_limiter.sleep()
 
-        self.log('Set pose to {} after {} tries'.format(position, tries), LOG_SUCCESS)
+        self.log('Set pose to {} after {} tries'.format(self.pos, tries), LOG_SUCCESS)
 
     def send_goal(self, position):
         """
@@ -596,7 +601,7 @@ class ObjectFinding:
             desired_theta -= 2 * math.pi
         return desired_theta - theta
 
-    def point_towards(self, position, ang_p=0.5, ang_max=0.75):
+    def point_towards(self, position, ang_p=0.5, ang_max=0.5):
         """
         Points robot towards provided position, uses P control
         @type position: Position
@@ -1112,6 +1117,7 @@ class ObjectFinding:
         """
         self.lin_vel = msg.twist.twist.linear.x
         self.ang_vel = msg.twist.twist.angular.z
+        self.pos = Position.from_pose(msg.pose.pose)
 
     def handle_depth_image(self, msg):
         """
@@ -1124,7 +1130,5 @@ if __name__ == '__main__':
     object_finding = ObjectFinding(
         [(find_green_box, 'Green box'), (find_fire_hydrant, 'Fire Hydrant'), (find_mail_box, 'Mailbox'),
          (find_number_5, 'Number 5')])
-    object_finding.set_initial_position(Position(-1.299982, 4.200055))
-    object_finding.find_space()
     object_finding.search()
     rospy.spin()
