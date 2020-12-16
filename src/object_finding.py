@@ -134,7 +134,7 @@ class ObjectFinding:
 
         self.bridge = cv_bridge.CvBridge()
         rospy.init_node('object_finding')
-        self.rate_limiter = rospy.Rate(30)
+        self.rate_limiter = rospy.Rate(10)
 
         rospy.Subscriber('camera/rgb/camera_info', CameraInfo, self.handle_camera_info)
         rospy.Subscriber('amcl_pose', PoseWithCovarianceStamped, self.handle_amcl_pose)
