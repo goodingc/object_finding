@@ -45,12 +45,13 @@ def find_fire_hydrant(image):
 
     # Apply morphological transformations to join segments of fire hydrant together 
     # And to remove erroneous responses 
-    kernel = np.ones((3,3),np.uint8)    
-    mask = cv2.dilate(mask,kernel,iterations = 1)
-    mask = cv2.erode(mask,kernel,iterations = 3)
-    mask = cv2.dilate(mask,kernel,iterations = 1)
-    
-    _, contours, _ = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)  # Extract contours (edges) from binary mask
+    kernel = np.ones((3, 3), np.uint8)
+    mask = cv2.dilate(mask, kernel, iterations=1)
+    mask = cv2.erode(mask, kernel, iterations=3)
+    mask = cv2.dilate(mask, kernel, iterations=1)
+
+    _, contours, _ = cv2.findContours(mask, cv2.RETR_TREE,
+                                      cv2.CHAIN_APPROX_SIMPLE)  # Extract contours (edges) from binary mask
 
     if len(contours) == 0:  # Exit if no contours (edges) found in binary image
         return
@@ -106,14 +107,15 @@ def find_mail_box(image):
 
     return [X_Pos, Y_Pos]
 
+
 def find_number_5(image):
     """
-        @author Mohamed
-        @param image: Colour image from camera
-        @return: The screen-space coordinates of the number 5 box
+    @author Mohamed
+    @param image: Colour image from camera
+    @return: The screen-space coordinates of the number 5 box
     """
     hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-    mask = cv2.inRange(hsv, np.array([0, 0, 0], dtype='uint8'),np.array([0, 0, 0], dtype='uint8'))
+    mask = cv2.inRange(hsv, np.array([0, 0, 0], dtype='uint8'), np.array([0, 0, 0], dtype='uint8'))
     _, contours, _ = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_NONE)
     if len(contours) is 0:
         return
