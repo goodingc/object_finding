@@ -120,7 +120,7 @@ def find_number_5(image):
     if len(contours) is 0:
         return
     largest_contour = contours[np.argmax(map(cv2.contourArea, contours))]
-    if cv2.contourArea(largest_contour) < 10:
+    if cv2.contourArea(largest_contour) < 10 or cv2.contourArea(largest_contour) > 15500:
         return
     moments = cv2.moments(largest_contour)
     return moments["m10"] / moments["m00"], moments["m01"] / moments["m00"]
