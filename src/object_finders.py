@@ -20,7 +20,7 @@ def find_green_box(image):
 
     largest_contour = contours[np.argmax(map(cv2.contourArea, contours))]
 
-    if cv2.contourArea(largest_contour) < 10:  # Ignore areas below a certain size, which are erroneous responses
+    if cv2.contourArea(largest_contour) < 50:  # Ignore areas below a certain size, which are erroneous responses
         return
 
     moments = cv2.moments(

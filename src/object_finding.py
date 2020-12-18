@@ -120,6 +120,8 @@ class ObjectFinding:
 
     log_messages = []  # type: List[Tuple[str, int]]
 
+    checkpoint_attempts = 0
+
     def __init__(self, object_finders, synchronize=True):
         """
         @type object_finders: Tuple[Callable[[ndarray], Tuple[int,int]], str]
@@ -190,6 +192,8 @@ class ObjectFinding:
         @type vel_p: float
         @author Callum
         """
+        if math.isinf(self.scan_ranges[0]) or math.isinf(self.scan_ranges[180]):
+            return
         self.log('Finding space')
         offset = (self.scan_ranges[0] - self.scan_ranges[180]) / 2
         while not -offset_tolerance < offset < offset_tolerance:
@@ -198,7 +202,7 @@ class ObjectFinding:
             self.send_velocity(linear=offset * vel_p)
 
         self.log('Found space', LOG_SUCCESS)
-        self.stop(cancel=False)
+        self.stop()
 
     def sleep(self):
         """
@@ -550,9 +554,28 @@ class ObjectFinding:
         candidate_checkpoints = visible_checkpoints if len(visible_checkpoints) > 0 else self.unvisited
 
         # Calculate closest checkpoint from candidate pool
-        self.next_checkpoint = candidate_checkpoints[
+        next_candidate = candidate_checkpoints[
             int(np.argmin(map(lambda c: self.amcl_pos.distance_from(c), candidate_checkpoints)))
         ]
+        if next_candidate == self.next_checkpoint:
+            self.checkpoint_attempts += 1
+            if self.checkpoint_attempts == 5:
+                self.log('Too many attempts, using next checkpoint', LOG_ERROR)
+                next_candidate = candidate_checkpoints[
+                    int(
+                        np.argmin(
+                            map(
+                                lambda c: self.amcl_pos.distance_from(c),
+                                filter(lambda c: c != next_candidate, candidate_checkpoints)
+                            )
+                        )
+                    )
+                ]
+                self.checkpoint_attempts = 0
+        else:
+            self.checkpoint_attempts = 0
+
+        self.next_checkpoint = next_candidate
         self.log("Chosen {}".format(self.next_checkpoint))
 
     def next_checkpoint_distance(self):
@@ -607,7 +630,7 @@ class ObjectFinding:
         @type position: Position
         @param ang_p: P controller value
         @param ang_max: Maximum angular velocity
-        @return True if approach was attempted, False otherwise
+        @return Find code
         @author Callum
         """
         self.log('Turning towards {}'.format(position))
@@ -617,12 +640,16 @@ class ObjectFinding:
         while abs(delta_theta) > 0.1:
             self.sleep()
             # Abort if attempted approach
-            if self.look_for_objects() != FIND_FAIL:
-                return True
+            look = self.look_for_objects()
+            if look != FIND_FAIL:
+                return look
             self.send_velocity(angular=clamp(delta_theta * ang_p, ang_max))
             delta_theta = self.theta_offset(desired_theta)
+        look = self.stop()
+        if look != FIND_FAIL:
+            return look
         self.log('Pointed towards {}'.format(position), LOG_SUCCESS)
-        return False
+        return FIND_FAIL
 
     def check_all_found(self):
         """
@@ -654,7 +681,7 @@ class ObjectFinding:
             # Determine next checkpoint and set as target
             self.set_next_checkpoint()
             if self.next_checkpoint_distance() > 0.3:
-                if self.point_towards(self.next_checkpoint):
+                if self.point_towards(self.next_checkpoint) != FIND_FAIL:
                     # End if all found
                     if self.check_all_found():
                         return
@@ -786,8 +813,8 @@ class ObjectFinding:
             if self.approach_distance() < 1 and self.danger_close():
                 break
 
-        self.action_client.cancel_all_goals()
-        self.stop()
+        self.stop(cancel=True, look=False)
+        self.point_towards(self.approach_pos)
         finder.approached = True
         return True
 
@@ -833,7 +860,7 @@ class ObjectFinding:
         ])
         return True
 
-    def stop(self, cancel=True, stop_p=0.5):
+    def stop(self, cancel=True, stop_p=0.5, look=True):
         """
         Stops the robot and optionally cancels action server goals
         @type cancel: bool
@@ -848,12 +875,21 @@ class ObjectFinding:
         # Slow down
         while abs(self.lin_vel) > 0.01:
             self.sleep()
+            if look:
+                look_result = self.look_for_objects()
+                if look_result != FIND_FAIL:
+                    return look_result
             self.send_velocity(linear=self.lin_vel * stop_p)
 
         # Stop and hold
         for _ in range(10):
             self.sleep()
+            if look:
+                look_result = self.look_for_objects()
+                if look_result != FIND_FAIL:
+                    return look_result
             self.send_velocity()
+        return FIND_FAIL
 
     def log(self, message, level=LOG_INFO):
         """
@@ -996,6 +1032,7 @@ class ObjectFinding:
         status_labels = [
             ('checkpoint distance', self.next_checkpoint, lambda: format_float(self.next_checkpoint_distance())),
             ('checkpoint time', self.last_checkpoint_time, lambda: format_float(self.elapsed_checkpoint_time())),
+            ('checkpoint attempts', True, lambda: self.checkpoint_attempts),
             ('scan min', self.scan_ranges, lambda: format_float(self.scan_min())),
             ('danger close', self.scan_ranges, lambda: format_bool(self.danger_close())),
             ('linear velocity', self.lin_vel, lambda: format_float(self.lin_vel)),
