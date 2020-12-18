@@ -10,8 +10,8 @@ def find_green_box(image):
     """
 
     hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)  # Convert image to HSV colour space
-    mask = cv2.inRange(hsv, np.array([50, 0, 0], dtype='uint8'),
-                       np.array([70, 255, 255], dtype='uint8'))  # Apply thresholding to obtain binary mask
+    mask = cv2.inRange(hsv, np.array([60, 0, 0], dtype='uint8'),
+                       np.array([60, 255, 255], dtype='uint8'))  # Apply thresholding to obtain binary mask
     _, contours, _ = cv2.findContours(mask, cv2.RETR_TREE,
                                       cv2.CHAIN_APPROX_SIMPLE)  # Extract contours (edges) from binary mask
 
