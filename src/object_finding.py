@@ -192,7 +192,7 @@ class ObjectFinding:
         @type vel_p: float
         @author Callum
         """
-        if math.isinf(self.scan_ranges[0]) or math.isinf(self.scan_ranges[180]):
+        if self.scan_ranges[0] > 1 and self.scan_ranges[180] > 1:
             return
         self.log('Finding space')
         offset = (self.scan_ranges[0] - self.scan_ranges[180]) / 2
@@ -551,28 +551,22 @@ class ObjectFinding:
 
         # Use visiable checkpoints if possible, fallback to all checkpoints
         visible_checkpoints = list(filter(is_visible, self.unvisited))
-        candidate_checkpoints = visible_checkpoints if len(visible_checkpoints) > 0 else self.unvisited
+        candidate_checkpoints = visible_checkpoints if len(visible_checkpoints) > 0 else list(self.unvisited)
+
+        candidate_checkpoints.sort(key=self.amcl_pos.distance_from)
 
         # Calculate closest checkpoint from candidate pool
-        next_candidate = candidate_checkpoints[
-            int(np.argmin(map(lambda c: self.amcl_pos.distance_from(c), candidate_checkpoints)))
-        ]
+        next_candidate = candidate_checkpoints[0]
         if next_candidate == self.next_checkpoint:
             self.checkpoint_attempts += 1
-            if self.checkpoint_attempts == 5:
-                self.log('Too many attempts, using next checkpoint', LOG_ERROR)
-                next_candidate = candidate_checkpoints[
-                    int(
-                        np.argmin(
-                            map(
-                                lambda c: self.amcl_pos.distance_from(c),
-                                filter(lambda c: c != next_candidate, candidate_checkpoints)
-                            )
-                        )
-                    )
-                ]
+            if self.checkpoint_attempts == 3:
+                self.log('Too many retries, aborting checkpoint', LOG_ERROR)
+                self.unvisited.remove(self.next_checkpoint)
+                next_candidate = candidate_checkpoints[1]
+                self.set_checkpoint_time()
                 self.checkpoint_attempts = 0
         else:
+            self.set_checkpoint_time()
             self.checkpoint_attempts = 0
 
         self.next_checkpoint = next_candidate
@@ -618,13 +612,17 @@ class ObjectFinding:
         """
         theta = self.amcl_pos.theta
         # Normalize desired theta
+        # print theta, desired_theta
         if abs(desired_theta - theta) > abs(desired_theta + 2 * math.pi - theta):
             desired_theta += 2 * math.pi
+            # print 'added', desired_theta
         elif abs(desired_theta - theta) > abs(desired_theta - 2 * math.pi - theta):
             desired_theta -= 2 * math.pi
+            # print 'removed', desired_theta
+        # print desired_theta - theta
         return desired_theta - theta
 
-    def point_towards(self, position, ang_p=0.5, ang_max=0.5):
+    def point_towards(self, position, ang_p=0.5, ang_max=0.5, look=True):
         """
         Points robot towards provided position, uses P control
         @type position: Position
@@ -637,17 +635,18 @@ class ObjectFinding:
         desired_theta = self.amcl_pos.direction_to(position)
         delta_theta = self.theta_offset(desired_theta)
         # While not aligned
-        while abs(delta_theta) > 0.1:
+        while abs(delta_theta) > 0.15:
             self.sleep()
             # Abort if attempted approach
-            look = self.look_for_objects()
-            if look != FIND_FAIL:
-                return look
+            if look:
+                look_result = self.look_for_objects()
+                if look_result != FIND_FAIL:
+                    return look_result
             self.send_velocity(angular=clamp(delta_theta * ang_p, ang_max))
             delta_theta = self.theta_offset(desired_theta)
-        look = self.stop()
-        if look != FIND_FAIL:
-            return look
+        look_result = self.stop(look=look)
+        if look_result != FIND_FAIL:
+            return look_result
         self.log('Pointed towards {}'.format(position), LOG_SUCCESS)
         return FIND_FAIL
 
@@ -688,7 +687,6 @@ class ObjectFinding:
                     continue
             self.send_goal(self.next_checkpoint)
             self.stationary_ticks = 0
-            self.set_checkpoint_time()
             reset = False
             # Loop until contact with checkpoint
             while self.next_checkpoint_distance() > 0.3:
@@ -697,6 +695,7 @@ class ObjectFinding:
                 # Abort if taken too long, never usually happens
                 if self.checkpoint_timeout():
                     self.log('Took too long to get to checkpoint, aborting', LOG_ERROR)
+                    self.unvisited.remove(self.next_checkpoint)
                     reset = True
                     break
 
@@ -799,6 +798,7 @@ class ObjectFinding:
             other_finder.screen_pos = None
         self.next_checkpoint = None
         self.approach_pos = Position(finder.object_pos[0], finder.object_pos[1])
+        self.approach_pos.theta = self.amcl_pos.direction_to(self.approach_pos)
         self.send_goal(self.approach_pos)
         self.stationary_ticks = 0
         self.set_checkpoint_time()
@@ -814,7 +814,7 @@ class ObjectFinding:
                 break
 
         self.stop(cancel=True, look=False)
-        self.point_towards(self.approach_pos)
+        self.point_towards(self.approach_pos, look=False)
         finder.approached = True
         return True
 
@@ -872,14 +872,14 @@ class ObjectFinding:
         if cancel:
             self.action_client.cancel_all_goals()
 
-        # Slow down
-        while abs(self.lin_vel) > 0.01:
-            self.sleep()
-            if look:
-                look_result = self.look_for_objects()
-                if look_result != FIND_FAIL:
-                    return look_result
-            self.send_velocity(linear=self.lin_vel * stop_p)
+        # # Slow down
+        # while abs(self.lin_vel) > 0.01:
+        #     self.sleep()
+        #     if look:
+        #         look_result = self.look_for_objects()
+        #         if look_result != FIND_FAIL:
+        #             return look_result
+        #     self.send_velocity(linear=self.lin_vel * stop_p)
 
         # Stop and hold
         for _ in range(10):
@@ -942,10 +942,6 @@ class ObjectFinding:
             )
         ).astype(np.uint8)
 
-        # Display current position on map
-        if self.amcl_pos is not None:
-            cv2.circle(room_image, to_room_image(self.amcl_pos), 10, (255, 255, 0), -1)
-
         # Display calculated checkpoints
         if self.checkpoints is not None:
             for checkpoint in self.checkpoints:
@@ -958,6 +954,16 @@ class ObjectFinding:
 
         if self.next_checkpoint is not None:
             cv2.circle(room_image, to_room_image(self.next_checkpoint), 10, (0, 255, 255), -1)
+
+        # Display current position on map
+        if self.amcl_pos is not None:
+            room_pos = to_room_image(self.amcl_pos)
+            cv2.circle(room_image, room_pos, 10, (255, 255, 0), -1)
+            theta = self.amcl_pos.theta - math.pi / 2
+            cv2.arrowedLine(room_image, room_pos, (
+                room_pos[0] + int(math.sin(theta) * 30),
+                room_pos[1] + int(math.cos(theta) * 30),
+            ), (255, 255, 0), 3, tipLength=0.5)
 
         def draw_text(text, position, color=(255, 255, 255), img=out):
             """
@@ -984,7 +990,7 @@ class ObjectFinding:
                     ring_color = (0, 255, 255)
                 cv2.circle(room_image, room_pos, 13, ring_color, -1)
                 cv2.circle(room_image, room_pos, 10, (255, 0, 0), -1)
-                draw_text(finder.name, room_pos, (0, 0, 0), room_image)
+                draw_text(finder.name, (room_pos[0], room_pos[1] - 10), (0, 0, 0), room_image)
             if finder.screen_pos is not None and not finder.found:
                 screen_x, screen_y = finder.screen_pos
                 cv2.circle(rgb_camera_output, (int(screen_x / 2), int(screen_y / 2)), 10, (255, 0, 0))
